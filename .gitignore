@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Model files
+models/
+checkpoints/
+
+# Generated output
+results/
+*.log
+*.trace
+
+# Editor/OS
+.DS_Store
