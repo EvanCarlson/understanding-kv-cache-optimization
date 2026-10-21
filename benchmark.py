@@ -1,24 +1,30 @@
+"""Benchmark FP32 cache variants and merge measured results into a JSON report."""
+
 import argparse
 import json
 import logging
 import os
 import time
+from collections.abc import Collection
+from dataclasses import dataclass
 from pathlib import Path
 
 import modal
 import numpy as np
 import tiktoken
 import torch
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from torch.profiler import ProfilerActivity, profile
 from tqdm import tqdm
 
 from generate import (
+    ATTENTION_BACKEND_CHOICES,
     GPT2_SMALL_D_MODEL,
     GPT2_SMALL_MAX_POSITIONS,
     GPT2_SMALL_N_LAYERS,
     GPT2_SMALL_NUM_HEADS,
     load_pretrained_model,
+    validate_optimization_options,
 )
 from model import KVCacheFactory, KVCacheProtocol, ModelConfig, TinyTransformer
 from shared import DEFAULT_SEED, Device, get_device, seed_everything
@@ -54,9 +60,15 @@ class BenchmarkPoint(BaseModel):
     decode_latency: LatencyPercentiles | None
     throughput_tokens_per_sec: float | None
     num_trials: int
+    # Both cache byte counts describe the prompt immediately after prefill.
     cache_bytes_used: int
     peak_memory_bytes: int
+    cache_bytes_allocated: int = 0
+    timed_steps: int = 0
     oom: bool
+    # One list of step latencies per completed trial, kept so confidence intervals
+    # can resample trials. Reports written before this field existed load as [].
+    trial_latencies_ms: list[list[float]] = Field(default_factory=list)
 
 
 class CacheBenchmark(BaseModel):
@@ -64,6 +76,26 @@ class CacheBenchmark(BaseModel):
     cache_type: str
     gpu_type: str
     points: list[BenchmarkPoint]
+    num_kv_heads: int = GPT2_SMALL_NUM_HEADS
+    model_repo: str = DEFAULT_MODEL_REPO
+    seed: int = DEFAULT_SEED
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
+    max_seq_len: int = 0
+    torch_version: str = "unknown"
+    dtype: str = "float32"
+    attention_backend: str = "expanded"
+    uptraining: bool = False
+
+
+@dataclass(frozen=True)
+class PrefillResult:
+    """Decode-ready state with cache byte counts snapshotted before warmup."""
+
+    cache: KVCacheProtocol | None
+    running_ids: torch.Tensor
+    next_token: torch.Tensor
+    cache_bytes_used: int
+    cache_bytes_allocated: int
 
 
 def _sync_device(device: torch.device) -> None:
@@ -96,12 +128,47 @@ def _load_results(path: Path) -> dict[str, CacheBenchmark]:
     }
 
 
-def _save_results(path: Path, results: dict[str, CacheBenchmark]) -> None:
+def _check_result_conflicts(
+    *,
+    path: Path,
+    existing_keys: Collection[str],
+    result_keys: Collection[str],
+    overwrite: bool,
+) -> None:
+    conflicts = sorted(set(existing_keys).intersection(result_keys))
+    if conflicts and not overwrite:
+        raise FileExistsError(
+            f"Result keys {', '.join(conflicts)} already exist in {path}; "
+            "pass --overwrite to replace them or choose a different --output path"
+        )
+
+
+def _save_results(
+    path: Path, results: dict[str, CacheBenchmark], *, overwrite: bool = False
+) -> None:
+    # Reload at write time: a long-running benchmark must not discard entries
+    # added since preflight, or rewrite historical entries with schema defaults.
+    payload = json.loads(path.read_text()) if path.exists() else {}
+    _check_result_conflicts(
+        path=path,
+        existing_keys=payload.keys(),
+        result_keys=results.keys(),
+        overwrite=overwrite,
+    )
+    payload.update({key: benchmark.model_dump() for key, benchmark in results.items()})
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        cache_type: benchmark.model_dump() for cache_type, benchmark in results.items()
-    }
     path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def _result_key(benchmark: CacheBenchmark) -> str:
+    key = (
+        f"gqa_h{benchmark.num_kv_heads}"
+        if benchmark.cache_type == "gqa"
+        else benchmark.cache_type
+    )
+    if benchmark.attention_backend != "expanded" or benchmark.dtype != "float32":
+        key += f"_{benchmark.attention_backend}_{benchmark.dtype}"
+    return key
 
 
 def _latency_percentiles(latencies_ms: list[float]) -> LatencyPercentiles:
@@ -131,7 +198,7 @@ def _decode_step(
     running_ids = (
         torch.cat([running_ids, next_token], dim=1) if cache is None else next_token
     )
-    logits = model(running_ids, cache=cache)
+    logits = model(running_ids, cache=cache, logits_to_keep=1)
 
     return running_ids, logits
 
@@ -150,7 +217,7 @@ def _prefill_and_warmup(
     context_length: int,
     batch_size: int,
     device: torch.device,
-) -> tuple[KVCacheProtocol | None, torch.Tensor, torch.Tensor, int]:
+) -> PrefillResult:
     _release_cached_memory(device)
     cache = _create_cache(
         cache_type=cache_type, config=config, batch_size=batch_size, device=device
@@ -160,9 +227,10 @@ def _prefill_and_warmup(
     )
 
     with torch.no_grad():
-        logits = model(running_ids, cache=cache)
+        logits = model(running_ids, cache=cache, logits_to_keep=1)
 
     cache_bytes_used = cache.used_nbytes if cache is not None else 0
+    cache_bytes_allocated = cache.allocated_nbytes if cache is not None else 0
     next_token = _argmax_next_token(logits)
 
     # Warmup: prime the decode-shaped (seq_len=1) kernels before timing.
@@ -173,7 +241,13 @@ def _prefill_and_warmup(
 
     next_token = _argmax_next_token(logits)
 
-    return cache, running_ids, next_token, cache_bytes_used
+    return PrefillResult(
+        cache=cache,
+        running_ids=running_ids,
+        next_token=next_token,
+        cache_bytes_used=cache_bytes_used,
+        cache_bytes_allocated=cache_bytes_allocated,
+    )
 
 
 def _all_eos(next_token: torch.Tensor, *, eos_token_id: int) -> bool:
@@ -190,8 +264,8 @@ def _run_trial(
     max_new_tokens: int,
     eos_token_id: int,
     device: torch.device,
-) -> tuple[list[float], int]:
-    cache, running_ids, next_token, cache_bytes_used = _prefill_and_warmup(
+) -> tuple[list[float], int, int]:
+    prefill = _prefill_and_warmup(
         model=model,
         cache_type=cache_type,
         config=config,
@@ -200,10 +274,14 @@ def _run_trial(
         device=device,
     )
 
+    cache = prefill.cache
+    running_ids, next_token = prefill.running_ids, prefill.next_token
+    cache_bytes_used = prefill.cache_bytes_used
+    cache_bytes_allocated = prefill.cache_bytes_allocated
     latencies_ms: list[float] = []
 
     if _all_eos(next_token, eos_token_id=eos_token_id):
-        return latencies_ms, cache_bytes_used
+        return latencies_ms, cache_bytes_used, cache_bytes_allocated
 
     for _ in range(max_new_tokens):
         _sync_device(device)
@@ -225,7 +303,7 @@ def _run_trial(
         if _all_eos(next_token, eos_token_id=eos_token_id):
             break
 
-    return latencies_ms, cache_bytes_used
+    return latencies_ms, cache_bytes_used, cache_bytes_allocated
 
 
 def _run_sweep_point(
@@ -243,14 +321,15 @@ def _run_sweep_point(
     if device.type == Device.CUDA:
         torch.cuda.reset_peak_memory_stats(device)
 
-    trial_latencies_ms: list[float] = []
+    trial_latencies_ms: list[list[float]] = []
     cache_bytes_used = 0
+    cache_bytes_allocated = 0
     completed_trials = 0
     oom = False
 
     for _ in range(num_trials):
         try:
-            latencies_ms, cache_bytes_used = _run_trial(
+            latencies_ms, cache_bytes_used, cache_bytes_allocated = _run_trial(
                 model=model,
                 cache_type=cache_type,
                 config=config,
@@ -269,15 +348,16 @@ def _run_sweep_point(
             _release_cached_memory(device)
             break
 
-        trial_latencies_ms.extend(latencies_ms)
+        trial_latencies_ms.append(latencies_ms)
         completed_trials += 1
 
     peak_memory_bytes = (
         torch.cuda.max_memory_allocated(device) if device.type == Device.CUDA else 0
     )
 
+    pooled_latencies_ms = [ms for trial in trial_latencies_ms for ms in trial]
     decode_latency = (
-        _latency_percentiles(trial_latencies_ms) if trial_latencies_ms else None
+        _latency_percentiles(pooled_latencies_ms) if pooled_latencies_ms else None
     )
     # Tokens generated per second across the whole batch during
     # steady-state decode, using the per-step p50 as representative.
@@ -293,7 +373,10 @@ def _run_sweep_point(
         num_trials=completed_trials,
         cache_bytes_used=cache_bytes_used,
         peak_memory_bytes=peak_memory_bytes,
+        cache_bytes_allocated=cache_bytes_allocated,
+        timed_steps=len(pooled_latencies_ms),
         oom=oom,
+        trial_latencies_ms=trial_latencies_ms,
     )
 
 
@@ -307,7 +390,7 @@ def _capture_trace(
     context_length: int,
     device: torch.device,
 ) -> bytes:
-    cache, running_ids, next_token, _ = _prefill_and_warmup(
+    prefill = _prefill_and_warmup(
         model=model,
         cache_type=cache_type,
         config=config,
@@ -322,7 +405,10 @@ def _capture_trace(
 
     with profile(activities=activities, record_shapes=False) as prof, torch.no_grad():
         _decode_step(
-            model=model, cache=cache, running_ids=running_ids, next_token=next_token
+            model=model,
+            cache=prefill.cache,
+            running_ids=prefill.running_ids,
+            next_token=prefill.next_token,
         )
 
     trace_path = Path(f"/tmp/{cache_type}_trace.json")
@@ -343,7 +429,16 @@ def run_benchmark(
     device: torch.device,
     capture_trace: bool,
     seed: int,
+    num_kv_heads: int = GPT2_SMALL_NUM_HEADS,
+    attention_backend: str = "expanded",
 ) -> tuple[CacheBenchmark, bytes | None]:
+    validate_optimization_options(
+        cache_type=cache_type, attention_backend=attention_backend
+    )
+    if num_kv_heads <= 0 or GPT2_SMALL_NUM_HEADS % num_kv_heads:
+        raise ValueError("num_kv_heads must be a positive divisor of 12")
+    if cache_type != "gqa" and num_kv_heads != GPT2_SMALL_NUM_HEADS:
+        raise ValueError("Reduced KV heads require cache_type='gqa'")
     seed_everything(seed=seed)
     tokenizer = tiktoken.get_encoding("gpt2")
 
@@ -372,7 +467,8 @@ def run_benchmark(
         d_model=GPT2_SMALL_D_MODEL,
         n_layers=GPT2_SMALL_N_LAYERS,
         num_heads=GPT2_SMALL_NUM_HEADS,
-        num_kv_heads=GPT2_SMALL_NUM_HEADS,
+        num_kv_heads=num_kv_heads,
+        attention_backend=attention_backend,
         max_seq_len=max_seq_len,
     )
     model = load_pretrained_model(config=config, model_repo=model_repo, device=device)
@@ -386,6 +482,7 @@ def run_benchmark(
     ]
 
     for context_length, batch_size in tqdm(sweep_points, desc=f"{cache_type} sweep"):
+        seed_everything(seed=seed)
         point = _run_sweep_point(
             model=model,
             cache_type=cache_type,
@@ -443,7 +540,16 @@ def run_benchmark(
     )
 
     return CacheBenchmark(
-        cache_type=cache_type, gpu_type=gpu_type, points=points
+        cache_type=cache_type,
+        gpu_type=gpu_type,
+        points=points,
+        num_kv_heads=num_kv_heads,
+        model_repo=model_repo,
+        seed=seed,
+        max_new_tokens=max_new_tokens,
+        max_seq_len=max_seq_len,
+        torch_version=torch.__version__,
+        attention_backend=attention_backend,
     ), trace_bytes
 
 
@@ -472,6 +578,8 @@ def remote_run_benchmark(
     gpu_type: str,
     capture_trace: bool,
     seed: int,
+    num_kv_heads: int = GPT2_SMALL_NUM_HEADS,
+    attention_backend: str = "expanded",
 ) -> tuple[dict, bytes | None]:
     benchmark, trace_bytes = run_benchmark(
         cache_type=cache_type,
@@ -484,6 +592,8 @@ def remote_run_benchmark(
         device=torch.device("cuda"),
         capture_trace=capture_trace,
         seed=seed,
+        num_kv_heads=num_kv_heads,
+        attention_backend=attention_backend,
     )
 
     return benchmark.model_dump(), trace_bytes
@@ -493,13 +603,19 @@ def _parse_int_list(value: str) -> list[int]:
     return [int(part) for part in value.split(",")]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--cache-type",
         default=DEFAULT_CACHE_TYPE,
         choices=CACHE_TYPE_CHOICES,
         help="Which cache to benchmark",
+    )
+    parser.add_argument(
+        "--num-kv-heads",
+        type=int,
+        choices=[1, 2, 3, 4, 6, 12],
+        help="KV heads per layer (default: 3 for gqa, 12 otherwise)",
     )
     parser.add_argument(
         "--context-lengths",
@@ -554,7 +670,12 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=DEFAULT_RESULTS_PATH,
-        help="Shared results JSON path",
+        help="Shared results JSON path (existing keys require --overwrite)",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow replacing this benchmark's existing result key in --output",
     )
     parser.add_argument(
         "--traces-dir",
@@ -569,13 +690,44 @@ def parse_args() -> argparse.Namespace:
         help="Seed for reproducible benchmarking",
     )
 
-    return parser.parse_args()
+    parser.add_argument(
+        "--attention-backend",
+        choices=ATTENTION_BACKEND_CHOICES,
+        default="expanded",
+        help="Attention implementation (expanded or grouped, both FP32)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        validate_optimization_options(
+            cache_type=args.cache_type,
+            attention_backend=args.attention_backend,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.num_kv_heads is None:
+        args.num_kv_heads = 3 if args.cache_type == "gqa" else GPT2_SMALL_NUM_HEADS
+    if args.cache_type != "gqa" and args.num_kv_heads != GPT2_SMALL_NUM_HEADS:
+        parser.error("Reduced KV heads require --cache-type gqa")
+    return args
 
 
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    requested = CacheBenchmark(
+        cache_type=args.cache_type,
+        num_kv_heads=args.num_kv_heads,
+        attention_backend=args.attention_backend,
+        gpu_type=args.gpu_type,
+        points=[],
+    )
+    _check_result_conflicts(
+        path=args.output,
+        existing_keys=_load_results(args.output).keys(),
+        result_keys={_result_key(requested)},
+        overwrite=args.overwrite,
+    )
     capture_trace = not args.no_trace
 
     if args.modal:
@@ -592,6 +744,8 @@ def main() -> None:
                 gpu_type=args.gpu_type,
                 capture_trace=capture_trace,
                 seed=args.seed,
+                num_kv_heads=args.num_kv_heads,
+                attention_backend=args.attention_backend,
             )
 
         benchmark = CacheBenchmark.model_validate(benchmark_dict)
@@ -608,16 +762,17 @@ def main() -> None:
             device=device,
             capture_trace=capture_trace,
             seed=args.seed,
+            num_kv_heads=args.num_kv_heads,
+            attention_backend=args.attention_backend,
         )
 
-    results = _load_results(args.output)
-    results[args.cache_type] = benchmark
-    _save_results(args.output, results)
-    logger.info("Wrote %s entry to %s", args.cache_type, args.output)
+    result_key = _result_key(benchmark)
+    _save_results(args.output, {result_key: benchmark}, overwrite=args.overwrite)
+    logger.info("Wrote %s entry to %s", result_key, args.output)
 
     if trace_bytes is not None:
         args.traces_dir.mkdir(parents=True, exist_ok=True)
-        trace_path = args.traces_dir / f"{args.cache_type}.json"
+        trace_path = args.traces_dir / f"{result_key}.json"
         trace_path.write_bytes(trace_bytes)
         logger.info("Wrote trace to %s", trace_path)
 
