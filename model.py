@@ -1,3 +1,5 @@
+"""GPT-2-shaped transformer returning logits, with expanded/repeat_kv/grouped attention and KV caches."""
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar, Protocol, TypeVar, cast, runtime_checkable
@@ -5,6 +7,7 @@ from typing import ClassVar, Protocol, TypeVar, cast, runtime_checkable
 import torch
 from torch import nn
 from torch.profiler import record_function
+from transformers.models.llama.modeling_llama import repeat_kv
 
 
 @dataclass(frozen=True)
@@ -16,6 +19,11 @@ class ModelConfig:
     num_heads: int
     # Specific to GQA. num_kv_heads = 0 -> MHA
     num_kv_heads: int
+    attention_backend: str = "expanded"
+
+    def __post_init__(self) -> None:
+        if self.attention_backend not in ("expanded", "repeat_kv", "grouped"):
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
 
 
 @dataclass(frozen=True)
@@ -30,10 +38,10 @@ class KVCacheProtocol(Protocol):
         self,
         *,
         layer_idx: int,
-        keys: torch.Tensor,  # Shape: [B, H, S, K]
-        values: torch.Tensor,  # Shape: [B, H, S, K]
+        keys: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
+        values: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
     ) -> KVCacheAppendResult:
-        """Write new key/value tensors into the cache at the given layer index."""
+        """Write new K/V tensors into the cache at the given layer index."""
 
     def advance(self, *, num_new_tokens: int) -> None:
         """Commit the step's writes, advancing the cache's shared sequence length.
@@ -111,7 +119,7 @@ def _validate_append_inputs(
     expected_head_dim: int,
 ) -> None:
     if keys.ndim != 4 or values.ndim != 4:
-        raise ValueError("keys and values must both have shape [B, H, S, K]")
+        raise ValueError("keys and values must both have shape [B, H_kv, S, d_h]")
 
     if keys.shape != values.shape:
         raise ValueError(
@@ -148,12 +156,14 @@ class BaseKVCache:
         return self._length
 
     def advance(self, *, num_new_tokens: int) -> None:
-        self._length += num_new_tokens
+        new_length = self._length + num_new_tokens
 
-        if self._length > self.max_seq_len:
+        if new_length > self.max_seq_len:
             raise RuntimeError(
-                f"KV cache length exceeded max_seq_len: length={self._length}"
+                f"KV cache length exceeded max_seq_len: length={new_length}"
             )
+
+        self._length = new_length
 
     def _bounds_for_append(self, seq_len: int) -> tuple[int, int]:
         if seq_len <= 0:
@@ -232,8 +242,8 @@ class BasicKVCache(PreallocatedKVCache):
         self,
         *,
         layer_idx: int,
-        keys: torch.Tensor,  # Shape: [B, H, S, K]
-        values: torch.Tensor,  # Shape: [B, H, S, K]
+        keys: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
+        values: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
     ) -> KVCacheAppendResult:
         _validate_append_inputs(
             keys=keys,
@@ -292,8 +302,8 @@ class GQAKVCache(PreallocatedKVCache):
         self,
         *,
         layer_idx: int,
-        keys: torch.Tensor,  # Shape: [B, num_kv_heads, S, K]
-        values: torch.Tensor,  # Shape: [B, num_kv_heads, S, K]
+        keys: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
+        values: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
     ) -> KVCacheAppendResult:
         _validate_append_inputs(
             keys=keys,
@@ -358,7 +368,11 @@ class BlockedKVCache(BaseKVCache):
     def used_nbytes(self) -> int:
         element_size = torch.zeros((), dtype=self.dtype).element_size()
         elems_per_tensor = (
-            self.batch_size * self.num_heads * self._length * self.head_dim
+            self.n_layers
+            * self.batch_size
+            * self.num_heads
+            * self._length
+            * self.head_dim
         )
 
         return 2 * elems_per_tensor * element_size
@@ -381,8 +395,8 @@ class BlockedKVCache(BaseKVCache):
         self,
         *,
         layer_idx: int,
-        keys: torch.Tensor,  # Shape: [B, H, S, K]
-        values: torch.Tensor,  # Shape: [B, H, S, K]
+        keys: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
+        values: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
     ) -> KVCacheAppendResult:
         _validate_append_inputs(
             keys=keys,
@@ -522,8 +536,8 @@ class QuantizedKVCache(PreallocatedKVCache):
         self,
         *,
         layer_idx: int,
-        keys: torch.Tensor,  # Shape: [B, H, S, K]
-        values: torch.Tensor,  # Shape: [B, H, S, K]
+        keys: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
+        values: torch.Tensor,  # Shape: [B, H_kv, S, d_h]
     ) -> KVCacheAppendResult:
         _validate_append_inputs(
             keys=keys,
@@ -583,10 +597,11 @@ class TinyMultiHeadAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = config.d_model // num_query_heads
         self.layer_idx = layer_idx
+        self.attention_backend = config.attention_backend
 
         # We always use a full-width query projection, regardless of whether
-        # we use MHA (num_heads key/value heads), MQA (1 key/value head), or
-        # GQA (1 < key/value heads < num_heads).
+        # we use MHA (num_heads KV heads), MQA (1 KV head), or
+        # GQA (1 < KV heads < num_heads).
         self.Q_proj = nn.Linear(config.d_model, config.d_model, bias=True)
 
         kv_dim = self.num_kv_heads * self.head_dim
@@ -612,9 +627,54 @@ class TinyMultiHeadAttention(nn.Module):
             "kv_group_idx", torch.arange(self.num_query_heads) // group_size
         )
 
+    def attend(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, _, query_len, _ = queries.shape
+        key_len = keys.shape[2]
+        offset = key_len - query_len
+
+        if self.attention_backend == "grouped":
+            queries = queries.reshape(batch_size, self.num_kv_heads, -1, self.head_dim)
+        elif self.attention_backend == "repeat_kv":
+            n_rep = self.num_query_heads // self.num_kv_heads
+            keys = repeat_kv(keys, n_rep)
+            values = repeat_kv(values, n_rep)
+        else:
+            keys = keys[:, self.kv_group_idx, :, :]
+            values = values[:, self.kv_group_idx, :, :]
+
+        with record_function("attention_matmul"):
+            attn_scores = (
+                torch.matmul(queries, keys.transpose(2, 3)) / self.head_dim**0.5
+            )
+            attn_scores = attn_scores.reshape(
+                batch_size, self.num_query_heads, query_len, key_len
+            )
+            if query_len > 1:
+                if offset == 0:
+                    attn_scores = attn_scores.masked_fill(
+                        self.mask[:query_len, :query_len] == 0, -torch.inf
+                    )
+                else:
+                    attn_scores[..., -query_len:] = attn_scores[
+                        ..., -query_len:
+                    ].masked_fill(self.mask[:query_len, :query_len] == 0, float("-inf"))
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            if self.attention_backend == "grouped":
+                attn_weights = attn_weights.reshape(
+                    batch_size, self.num_kv_heads, -1, key_len
+                )
+            return torch.matmul(attn_weights, values).reshape(
+                batch_size, self.num_query_heads, query_len, self.head_dim
+            )
+
     def forward(
         self,
-        x: torch.Tensor,  # Shape: [B, S, D]
+        x: torch.Tensor,  # Shape: [B, S, d_model]
         *,
         cache: KVCacheProtocol | None = None,
     ) -> torch.Tensor:
@@ -623,14 +683,14 @@ class TinyMultiHeadAttention(nn.Module):
             keys = self.K_proj(x)
             values = self.V_proj(x)
 
-        # Split K, Q, V into multiple heads: [B, S, D] -> [B, S, H, K]
+        # Split Q, K, V into heads: [B, S, d_model] -> [B, S, H or H_kv, d_h]
         batch_size, seq_len, _ = queries.shape
 
         queries = queries.view(batch_size, seq_len, self.num_query_heads, self.head_dim)
         keys = keys.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         values = values.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
-        # [B, S, H, K] -> [B, H, S, K]
+        # [B, S, H or H_kv, d_h] -> [B, H or H_kv, S, d_h]
         keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
         values = values.transpose(1, 2)
@@ -641,57 +701,12 @@ class TinyMultiHeadAttention(nn.Module):
                 keys=keys,
                 values=values,
             )
-            all_keys, all_values = append_result.keys, append_result.values
+            keys, values = append_result.keys, append_result.values
 
-            # Retrieve KV cache per head
-            expanded_keys = all_keys[:, self.kv_group_idx, :, :]
-            expanded_values = all_values[:, self.kv_group_idx, :, :]
-
-            with record_function("attention_matmul"):
-                # Scaled dot-product attention
-                attn_scores = (
-                    torch.matmul(queries, expanded_keys.transpose(2, 3))
-                    / self.head_dim**0.5
-                )
-
-                # A single query (i.e. seq_len == 1) can see all past keys and values
-                if seq_len > 1:
-                    # A causal mask is only needed over the chunk's own final
-                    # seq_len key columns, to stop a query at local position i
-                    # from seeing chunk-local positions in the future.
-                    local_mask = self.mask[:seq_len, :seq_len]
-                    attn_scores[..., -seq_len:] = attn_scores[
-                        ..., -seq_len:
-                    ].masked_fill(
-                        local_mask == 0,
-                        float("-inf"),
-                    )
-
-                # Normalize attention scores
-                attn_weights = torch.softmax(attn_scores, dim=-1)
-
-                context_vect = torch.matmul(attn_weights, expanded_values)
-        else:
-            expanded_keys = keys[:, self.kv_group_idx, :, :]
-            expanded_values = values[:, self.kv_group_idx, :, :]
-
-            with record_function("attention_matmul"):
-                attn_scores = (
-                    torch.matmul(queries, expanded_keys.transpose(2, 3))
-                    / self.head_dim**0.5
-                )
-
-                # Mask future positions (causal attention)
-                attn_scores = attn_scores.masked_fill(
-                    self.mask[:seq_len, :seq_len] == 0, -torch.inf
-                )
-
-                attn_weights = torch.softmax(attn_scores, dim=-1)
-
-                context_vect = torch.matmul(attn_weights, expanded_values)
+        context_vect = self.attend(queries, keys, values)
 
         # Combine heads and project back to the original dimension
-        # [B, H, S, K] -> [B, S, H, K] -> [B, S, D]
+        # [B, H, S, d_h] -> [B, S, H, d_h] -> [B, S, d_model]
         context_vect = (
             context_vect.transpose(1, 2)
             .contiguous()
@@ -715,7 +730,7 @@ class TinyFeedForwardNetwork(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # Shape: [B, S, D]
+        x: torch.Tensor,  # Shape: [B, S, d_model]
     ) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(x)))
 
@@ -731,7 +746,7 @@ class TinyDecoderBlock(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # Shape: [B, S, D]
+        x: torch.Tensor,  # Shape: [B, S, d_model]
         *,
         cache: KVCacheProtocol | None = None,
     ) -> torch.Tensor:
@@ -762,7 +777,11 @@ class TinyTransformer(nn.Module):
         x: torch.Tensor,  # Shape: [B, S]
         *,
         cache: KVCacheProtocol | None = None,
+        logits_to_keep: int | None = None,
     ) -> torch.Tensor:
+        if logits_to_keep is not None and logits_to_keep < 1:
+            raise ValueError(f"logits_to_keep must be positive, got {logits_to_keep}")
+
         seq_len = x.shape[1]
         start_idx = cache.length if cache is not None else 0
 
@@ -782,19 +801,34 @@ class TinyTransformer(nn.Module):
         if cache is not None:
             cache.advance(num_new_tokens=seq_len)
 
+        # Prefill and uncached decode only need the last position's logits, and
+        # the full [B, S, vocab] tensor is huge (24 GiB at B=128, S=1,000).
+        if logits_to_keep is not None:
+            x = x[:, -logits_to_keep:, :]
+
         return self.lm_head(x)
+
+
+def _mean_pool_kv_heads(
+    tensor: torch.Tensor, *, attn: TinyMultiHeadAttention
+) -> torch.Tensor:
+
+    trailing_shape = tensor.shape[1:]
+    return (
+        tensor.reshape(
+            attn.num_kv_heads,
+            attn.num_query_heads // attn.num_kv_heads,
+            attn.head_dim,
+            *trailing_shape,
+        )
+        .mean(dim=1)
+        .reshape(attn.num_kv_heads * attn.head_dim, *trailing_shape)
+    )
 
 
 def load_gpt2_weights(
     model: TinyTransformer, *, gpt2_state_dict: dict[str, torch.Tensor]
 ) -> None:
-    first_attn = cast(TinyDecoderBlock, model.layers[0]).attn
-    if first_attn.num_kv_heads != first_attn.num_query_heads:
-        raise ValueError(
-            "GPT-2 checkpoints use full multi-head attention; they cannot be "
-            "loaded into a GQA/MQA model (num_kv_heads < num_query_heads) "
-            "without converting or pooling the K/V projection weights."
-        )
 
     max_seq_len = model.pos_embed.num_embeddings
 
@@ -816,6 +850,12 @@ def load_gpt2_weights(
             c_attn_bias = gpt2_state_dict[prefix + "attn.c_attn.bias"]
             q_w, k_w, v_w = c_attn_weight.split(d_model, dim=0)
             q_b, k_b, v_b = c_attn_bias.split(d_model, dim=0)
+
+            if layer.attn.num_kv_heads != layer.attn.num_query_heads:
+                k_w, v_w, k_b, v_b = (
+                    _mean_pool_kv_heads(tensor, attn=layer.attn)
+                    for tensor in (k_w, v_w, k_b, v_b)
+                )
 
             layer.attn.Q_proj.weight.copy_(q_w)
             layer.attn.Q_proj.bias.copy_(q_b)
