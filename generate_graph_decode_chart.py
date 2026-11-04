@@ -104,7 +104,7 @@ def make_figure(*, report_path: Path) -> plt.Figure:
     _plot_panel(ax=ax_graph, intervals=intervals, faster=faster, mode="graph")
     style_axis(
         ax=ax_eager,
-        title="Eager: launch overhead sets the floor",
+        title="Eager: overhead-bound",
         ylabel="p50 decode step (ms)",
         xlabel="Workload",
     )
